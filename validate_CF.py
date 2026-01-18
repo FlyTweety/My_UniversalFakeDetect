@@ -16,10 +16,15 @@ import pickle
 from tqdm import tqdm
 from io import BytesIO
 from copy import deepcopy
-from dataset_paths import DATASET_PATHS
+# from dataset_paths import DATASET_PATHS # 不需要这个了
 import random
 import shutil
 from scipy.ndimage.filters import gaussian_filter
+
+# --- 新增引用 ---
+from datasets import load_dataset, concatenate_datasets
+import io
+# ----------------
 
 SEED = 0
 def set_seed():
@@ -38,10 +43,6 @@ STD = {
     "imagenet":[0.229, 0.224, 0.225],
     "clip":[0.26862954, 0.26130258, 0.27577711]
 }
-
-
-
-
 
 def find_best_threshold(y_true, y_pred):
     "We assume first half is real 0, and the second half is fake 1"
@@ -99,14 +100,16 @@ def validate(model, loader, find_thres=False):
 
     with torch.no_grad():
         y_true, y_pred = [], []
-        print ("Length of dataset: %d" %(len(loader)))
-        for img, label in loader:
+        print ("Length of dataset: %d" %(len(loader))) # 打印出是batch数量，batch很大
+        for img, label in tqdm(loader):
             in_tens = img.cuda()
 
             y_pred.extend(model(in_tens).sigmoid().flatten().tolist())
             y_true.extend(label.flatten().tolist())
 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
+    print(len(y_true), y_true)
+    print(len(y_pred), y_pred)
 
     # ================== save this if you want to plot the curves =========== # 
     # torch.save( torch.stack( [torch.tensor(y_true), torch.tensor(y_pred)] ),  'baseline_predication_for_pr_roc_curve.pth' )
@@ -130,147 +133,113 @@ def validate(model, loader, find_thres=False):
 
     
     
-
-
-
 # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = # 
 
-
-
-
-def recursively_read(rootdir, must_contain, exts=["png", "jpg", "JPEG", "jpeg", "bmp"]):
-    out = [] 
-    for r, d, f in os.walk(rootdir):
-        for file in f:
-            if (file.split('.')[1] in exts)  and  (must_contain in os.path.join(r, file)):
-                out.append(os.path.join(r, file))
-    return out
-
-
-def get_list(path, must_contain=''):
-    if ".pickle" in path:
-        with open(path, 'rb') as f:
-            image_list = pickle.load(f)
-        image_list = [ item for item in image_list if must_contain in item   ]
-    else:
-        image_list = recursively_read(path, must_contain)
-    return image_list
-
-
-
-
-
 class RealFakeDataset(Dataset):
-    def __init__(self,  real_path, 
-                        fake_path, 
-                        data_mode, 
-                        max_sample,
-                        arch,
-                        jpeg_quality=None,
-                        gaussian_sigma=None):
+    def __init__(self, 
+                 # 以下参数保留接口兼容，但 path 参数不再使用
+                 real_path=None, 
+                 fake_path=None, 
+                 data_mode=None, 
+                 max_sample=1000,
+                 arch='imagenet',
+                 jpeg_quality=None,
+                 gaussian_sigma=None,
+                 cache_dir=None):
 
-        # assert data_mode in ["wang2020", "ours"]
         self.jpeg_quality = jpeg_quality
         self.gaussian_sigma = gaussian_sigma
         
-        # = = = = = = data path = = = = = = = = = # 
-        if type(real_path) == str and type(fake_path) == str:
-            real_list, fake_list = self.read_path(real_path, fake_path, data_mode, max_sample)
-        else:
-            real_list = []
-            fake_list = []
-            for real_p, fake_p in zip(real_path, fake_path):
-                real_l, fake_l = self.read_path(real_p, fake_p, data_mode, max_sample)
-                real_list += real_l
-                fake_list += fake_l
+        print(f"Loading dataset from Hugging Face... (Taking top {max_sample} per class, NO SHUFFLE)")
+        
+        # 1. 加载数据集
+        ds_args = {"path": "OwensLab/CommunityForensics-Eval", "split": "CompEval"}
+        if cache_dir:
+            ds_args["cache_dir"] = cache_dir
+            
+        full_ds = load_dataset(**ds_args)
 
-        self.total_list = real_list + fake_list
+        # 2. 按顺序筛选真假样本 seed=42
+        real_ds = full_ds.filter(lambda x: x['label'] == 0).shuffle(seed=42)
+        fake_ds = full_ds.filter(lambda x: x['label'] == 1).shuffle(seed=42)
 
+        # 3. 处理数量限制 (Max Sample) - 严格取前 N 个
+        if max_sample is not None:
+            # 取 min 防止越界，直接用 range 截取头部
+            limit_real = min(len(real_ds), max_sample)
+            limit_fake = min(len(fake_ds), max_sample)
+            
+            # 【核心修改】这里去掉了 shuffle，直接 select 前 limit 个
+            real_ds = real_ds.select(range(limit_real))
+            fake_ds = fake_ds.select(range(limit_fake))
+            
+            print(f"Selected top {limit_real} Real images and top {limit_fake} Fake images.")
 
-        # = = = = = =  label = = = = = = = = = # 
+        # 4. 合并 (保持顺序：先全是真，后全是假)
+        self.dataset = concatenate_datasets([real_ds, fake_ds])
+        
+        # 兼容性字段
+        self.total_list = range(len(self.dataset))
 
-        self.labels_dict = {}
-        for i in real_list:
-            self.labels_dict[i] = 0
-        for i in fake_list:
-            self.labels_dict[i] = 1
-
+        # = = = = = = Transform = = = = = = = = = # 
         stat_from = "imagenet" if arch.lower().startswith("imagenet") else "clip"
         self.transform = transforms.Compose([
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize( mean=MEAN[stat_from], std=STD[stat_from] ),
+            transforms.Normalize(mean=MEAN[stat_from], std=STD[stat_from]),
         ])
 
-
-    def read_path(self, real_path, fake_path, data_mode, max_sample):
-
-        if data_mode == 'wang2020':
-            real_list = get_list(real_path, must_contain='0_real')
-            fake_list = get_list(fake_path, must_contain='1_fake')
-        else:
-            real_list = get_list(real_path)
-            fake_list = get_list(fake_path)
-
-
-        if max_sample is not None:
-            if (max_sample > len(real_list)) or (max_sample > len(fake_list)):
-                max_sample = 100
-                print("not enough images, max_sample falling to 100")
-            random.shuffle(real_list)
-            random.shuffle(fake_list)
-            real_list = real_list[0:max_sample]
-            fake_list = fake_list[0:max_sample]
-
-        assert len(real_list) == len(fake_list)  
-
-        return real_list, fake_list
-
-
-
     def __len__(self):
-        return len(self.total_list)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
+        item = self.dataset[idx]
         
-        img_path = self.total_list[idx]
+        # 1. 获取图片
+        try:
+            image_bytes = item['image_data']
+            image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image at index {idx}: {e}")
+            image = Image.new('RGB', (224, 224))
 
-        label = self.labels_dict[img_path]
-        img = Image.open(img_path).convert("RGB")
-
-        if self.gaussian_sigma is not None:
-            img = gaussian_blur(img, self.gaussian_sigma) 
+        # 2. 应用 Augmentation (JPEG Compression / Gaussian Blur)
+        # 这一步必须在 Transform 转 Tensor 之前做
         if self.jpeg_quality is not None:
-            img = png2jpg(img, self.jpeg_quality)
+            image = png2jpg(image, self.jpeg_quality)
+        elif self.gaussian_sigma is not None:
+            image = gaussian_blur(image, self.gaussian_sigma)
 
-        img = self.transform(img)
-        return img, label
-
-
-
+        # 3. 获取标签
+        label = item['label'] 
+        
+        # 4. 应用 Standard Transform (Resize, ToTensor, Normalize)
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, label
 
 
 if __name__ == '__main__':
 
-
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--real_path', type=str, default=None, help='dir name or a pickle')
-    parser.add_argument('--fake_path', type=str, default=None, help='dir name or a pickle')
-    parser.add_argument('--data_mode', type=str, default=None, help='wang2020 or ours')
+    # 这些 path 参数虽然不用了，但为了命令行兼容性保留
+    parser.add_argument('--real_path', type=str, default=None, help='(Not used for HF dataset)')
+    parser.add_argument('--fake_path', type=str, default=None, help='(Not used for HF dataset)')
+    parser.add_argument('--data_mode', type=str, default=None, help='(Not used for HF dataset)')
+    
     parser.add_argument('--max_sample', type=int, default=1000, help='only check this number of images for both fake/real')
-
     parser.add_argument('--arch', type=str, default='res50')
     parser.add_argument('--ckpt', type=str, default='./pretrained_weights/fc_weights.pth')
-
     parser.add_argument('--result_folder', type=str, default='result', help='')
     parser.add_argument('--batch_size', type=int, default=128)
-
-    parser.add_argument('--jpeg_quality', type=int, default=None, help="100, 90, 80, ... 30. Used to test robustness of our model. Not apply if None")
-    parser.add_argument('--gaussian_sigma', type=int, default=None, help="0,1,2,3,4.     Used to test robustness of our model. Not apply if None")
-
+    parser.add_argument('--jpeg_quality', type=int, default=None, help="100, 90, 80, ... 30.")
+    parser.add_argument('--gaussian_sigma', type=int, default=None, help="0,1,2,3,4.")
+    
+    # 新增 cache_dir
+    parser.add_argument('--cache_dir', type=str, default=None, help="Hugging Face Dataset Cache Dir")
 
     opt = parser.parse_args()
-
     
     if os.path.exists(opt.result_folder):
         shutil.rmtree(opt.result_folder)
@@ -283,12 +252,11 @@ if __name__ == '__main__':
     model.eval()
     model.cuda()
 
-    if (opt.real_path == None) and (opt.fake_path == None):
-        dataset_paths = DATASET_PATHS
-    else:
-        dataset_paths = [ dict(real_path=opt.real_path, fake_path=opt.fake_path, data_mode=opt.data_mode, key="mine") ]
-
-
+    # --- 修改部分：不再遍历 DATASET_PATHS，而是指定为 HF Dataset ---
+    dataset_paths = [ 
+        dict(real_path=None, fake_path=None, data_mode=None, key="HF_CommunityForensics") 
+    ]
+    # -----------------------------------------------------------
 
     for dataset_path in (dataset_paths):
         set_seed()
@@ -301,6 +269,7 @@ if __name__ == '__main__':
                                     opt.arch,
                                     jpeg_quality=opt.jpeg_quality, 
                                     gaussian_sigma=opt.gaussian_sigma,
+                                    cache_dir=opt.cache_dir # 传入 cache_dir
                                     )
 
         loader = torch.utils.data.DataLoader(dataset, batch_size=opt.batch_size, shuffle=False, num_workers=4)
@@ -312,3 +281,5 @@ if __name__ == '__main__':
         with open( os.path.join(opt.result_folder,'acc0.txt'), 'a') as f:
             f.write(dataset_path['key']+': ' + str(round(r_acc0*100, 2))+'  '+str(round(f_acc0*100, 2))+'  '+str(round(acc0*100, 2))+'\n' )
 
+        with open( os.path.join(opt.result_folder,'acc1.txt'), 'a') as f:
+            f.write(dataset_path['key']+': ' + str(round(r_acc1*100, 2))+'  '+str(round(f_acc1*100, 2))+'  '+str(round(acc1*100, 2))+'\n' )
